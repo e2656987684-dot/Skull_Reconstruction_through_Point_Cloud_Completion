@@ -154,7 +154,7 @@ reproducible, so a lost cache rebuilds identically.
 
 The 20 trained checkpoints (4 loss configurations x 5 folds) are not in git.
 Download them from
-[Google Drive](https://drive.google.com/drive/folders/1VSVbRDqbq4DRXD3qe_STDTCYydIxe1ID).
+[Google Drive](https://drive.google.com/drive/folders/1GVBu1mkpPudQWbbdc18x1cAofw4eNWCl).
 
 | loss | runs |
 |---|---|
