@@ -1,0 +1,4 @@
+# Keep GitHub's language bar about the code: notebook outputs and the exported
+# 3D preview are tens of MB and would otherwise count as >99% of the repository.
+*.ipynb linguist-detectable=false
+reports/preview/*.html linguist-generated=true
