@@ -1,0 +1,942 @@
+"""Evaluation + presentation figures, shared by the notebooks.
+
+Everything that used to be copy-pasted into notebook cells lives here, because
+the copies drifted: the training notebook was loading one run's history next to
+another run's weights, and its curve title still claimed the train/validation
+gap was memorisation after that had been measured and disproved.
+
+Two rules carried over from mesh_viz:
+  * metrics come from the raw point clouds, never from a reconstructed mesh
+  * numbers before pictures -- a figure is for showing a conclusion, not
+    reaching one
+
+Typical use:
+
+    import report as rp
+    runs = rp.load_runs(REPO, ["baseline_es20", "msn_skullfix/rep_w05"])
+    rp.fig_curves(runs).show()
+    df = rp.eval_runs(REPO, runs)          # per-skull metrics, needs a GPU
+    print(rp.format_summary(df))
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+
+import numpy as np
+import pandas as pd
+
+# Same palette across every figure so slides look like one deck.
+C_TRAIN = "#1565C0"
+C_VAL = "#E64A19"
+C_GT = "#2E7D32"
+C_SERIES = ["#1565C0", "#E64A19", "#6A1B9A", "#00838F", "#EF6C00", "#37474F"]
+
+# F-score thresholds in normalised units. These two are what the source paper
+# reports (Table 1/2), so keeping them makes our numbers directly comparable.
+F1_THRESHOLDS = (0.05, 0.03)
+
+# ⚠️ SINCE 2026-08-28 THIS IS THE PREDICTION-SIDE TOLERANCE ONLY.
+#
+# The ground-truth side no longer needs a threshold: the defect region is the
+# implant the dataset ships, read from DEFECT_LABELS. The distance rule that used
+# to define it ("nearest input point further than 5 mm") was audited against that
+# implant and found to have precision 0.79 / recall 0.81 -- the COUNT was nearly
+# right (6.44% of ground-truth points against a true 6.18%) while the SET was
+# about a third wrong, 87 false positives per skull very nearly cancelling 71
+# false negatives. Both errors biased the metric the same way, optimistically:
+# the false positives sit on intact bone the model can copy, and the false
+# negatives are the hardest real points.
+#
+# This constant survives because the PREDICTION side still needs a tolerance --
+# a predicted point is an arbitrary point in space, so "is it on the implant" is
+# not a well-posed question and it is scored by proximity to the defect ground
+# truth instead. Kept at 5 mm, unchanged, so that side did not move.
+DEFECT_MM = 5.0
+
+# Per-point implant ground truth, written by src/eval/make_defect_labels.py.
+# A file rather than a computation: deriving it needs marching cubes over three
+# raw volumes per skull (~20 s), and `data/` is gitignored on a machine whose
+# /root is wiped by redeploys -- the labels are tracked, so evaluation survives
+# losing the raw data.
+DEFECT_LABELS = os.path.join("experiments_log", "defect_mask_labels.npz")
+_LABEL_CACHE = {}
+
+
+def defect_labels(repo):
+    """{skull id -> bool[6144]}, True where that point is on the implant."""
+    path = os.path.join(repo, DEFECT_LABELS)
+    if path not in _LABEL_CACHE:
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"{DEFECT_LABELS} does not exist -- the defect ground-truth labels have "
+                f"not been generated.\n"
+                f"run first: python src/eval/make_defect_labels.py")
+        _LABEL_CACHE[path] = {k: v for k, v in np.load(path).items()}
+    return _LABEL_CACHE[path]
+
+# Data paths are defined once in src/data/paths.py and re-exported here, so the
+# `rp.DATA_CACHE` call sites that predate that file keep working unchanged.
+# They are RELATIVE to the repo root on purpose: this module never assumes where
+# the data lives -- every function takes `repo` and joins it. An absolute constant
+# would silently DISCARD the caller's repo, since os.path.join drops everything
+# before an absolute component. `eval_runs` also still takes an explicit `data=`.
+_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+if _DATA_DIR not in sys.path:          # guarded: the notebooks reload this module
+    sys.path.insert(0, _DATA_DIR)
+import paths  # noqa: E402  -- needs the sys.path line above
+
+RAW_ROOT = paths.RAW_ROOT
+DATA_CACHE = paths.DATA_CACHE
+BERT_CACHE = paths.BERT_CACHE
+MSN_WEIGHTS = paths.MSN_WEIGHTS
+
+
+# --------------------------------------------------------------------------- #
+# loading
+# --------------------------------------------------------------------------- #
+class Run:
+    """One training run: its config, its curve, and where its weights are."""
+
+    def __init__(self, repo, rel, label=None):
+        self.rel = rel
+        self.dir = os.path.join(repo, "experiments", rel)
+        self.label = label or os.path.basename(rel)
+        # experiments/ is gitignored and lives on the ephemeral disk; experiments_log/
+        # is tracked. Falling back to it is what lets the reading half of
+        # MSN_eval_metrics.ipynb run on a fresh clone with no weights and no GPU.
+        self.log_dir = os.path.join(repo, "experiments_log", self.label)
+        src = self.dir if os.path.exists(os.path.join(self.dir, "run.json")) else self.log_dir
+        with open(os.path.join(src, "run.json")) as f:
+            self.meta = json.load(f)
+        self.hist = pd.read_csv(os.path.join(src, "history.csv"))
+        self.scale_mm = float(self.meta["scale_mm"])
+
+    @property
+    def weights(self):
+        """The checkpoint. Raises rather than handing back a path that is not there.
+
+        Checkpoints are not in git. The 20 k-fold ones are linked from
+        README.md; the single-split ones are not published.
+        """
+        p = os.path.join(self.dir, "best.h5")
+        if not os.path.exists(p):
+            raise FileNotFoundError(
+                f"{self.label}: no checkpoint at {p}. Records are still readable from "
+                f"{self.log_dir}. The k-fold checkpoints are linked from README.md.")
+        return p
+
+    @property
+    def arch_key(self):
+        """Which network topology these weights belong to.
+
+        Every field that changes the topology WITHOUT changing any weight shape
+        has to be listed here, because those are exactly the ones `load_weights`
+        cannot catch. Runs recorded before a field existed default to the value
+        that was in force at the time, so old run.json files stay readable.
+        """
+        m = self.meta
+        return (m.get("config", "paper"),
+                bool(m.get("per_point_attn", False)),
+                bool(m.get("use_text", True)),
+                bool(m.get("tie_qk_init", False)))
+
+    @property
+    def arch_label(self):
+        name, per_point, use_text, tie_qk = self.arch_key
+        bits = [name]
+        if per_point:
+            bits.append("pp_attn")
+        if not use_text:
+            bits.append("no_text")
+        if tie_qk:
+            bits.append("tie_qk")
+        return "+".join(bits)
+
+    @property
+    def best_epoch(self):
+        """1-indexed epoch of lowest val CD_t -- what best.h5 holds."""
+        return int(self.hist["val_cd_t_metric"].idxmin()) + 1
+
+    @property
+    def lr_drops(self):
+        """Epochs (1-indexed) where the learning rate was reduced.
+
+        Warm-up ramps up over the first ~5 epochs, so only decreases count.
+        Marking these on the curves is the point: the single largest gain in
+        this project came from making these fire at all.
+        """
+        lr = self.hist["lr"].to_numpy()
+        return [i + 1 for i in range(1, len(lr)) if lr[i] < lr[i - 1] - 1e-12]
+
+    def config_str(self):
+        m = self.meta
+        bits = [f"loss={m.get('loss', 'cd_dcd')}"]
+        if m.get("dcd_lambda", 1) != 1:
+            bits.append(f"λ={m['dcd_lambda']:g}")
+        if m.get("dcd_weight", 1) != 1:
+            bits.append(f"w_dcd={m['dcd_weight']:g}")
+        if m.get("repulsion_weight"):
+            bits.append(f"rep={m['repulsion_weight']:g}@{m.get('repulsion_r0_mm', 2):g}mm")
+        return "  ".join(bits)
+
+
+def load_runs(repo, specs):
+    """specs: list of "dir" or ("label", "dir")."""
+    out = []
+    for s in specs:
+        label, rel = (s, None) if isinstance(s, str) else (s[0], s[1])
+        out.append(Run(repo, rel if rel else label, label if rel else None))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# metrics
+# --------------------------------------------------------------------------- #
+def _dcd_numpy(dist1, dist2, idx1, idx2, n_pred, n_gt, alpha=1.0, n_lambda=1.0):
+    """msn_skullfix._dcd_from_raw, transcribed to numpy. Reported at lambda=1
+    regardless of what a run trained with, so the column stays comparable."""
+    w1 = np.bincount(idx1, minlength=n_pred)[idx1].astype(np.float64)
+    w1 = (w1 ** n_lambda + 1e-6) ** -1 * (n_gt / n_pred)
+    w2 = np.bincount(idx2, minlength=n_gt)[idx2].astype(np.float64)
+    w2 = (w2 ** n_lambda + 1e-6) ** -1 * (n_pred / n_gt)
+    return float(np.mean(1.0 - np.exp(-dist1 * alpha) * w1)
+                 + np.mean(1.0 - np.exp(-dist2 * alpha) * w2))
+
+
+def metrics_from_points(pred, gt, scale_mm, inp=None, defect_mask=None):
+    """Every point-cloud metric, from ONE pair of nearest-neighbour lookups.
+
+    Deliberately numpy + cKDTree rather than the TensorFlow versions in
+    msn_skullfix: those each materialise a (6144, 6144) matrix, so calling
+    calc_cd / calc_hausdorff / calc_f1 in sequence allocated three of them and
+    ran a 24 GB card out of memory. A KD-tree needs no such matrix, evaluation
+    then needs no GPU at all, and the definitions are identical (verified
+    against the TF implementations to within 1e-5).
+
+    dist1: gt -> pred      dist2: pred -> gt      both in normalised units.
+
+    Pass `inp` (the defective input cloud) to also get the defect-region columns;
+    without it those are simply absent, so existing callers keep working.
+    """
+    from scipy.spatial import cKDTree
+
+    P = np.asarray(pred, dtype=np.float64)
+    G = np.asarray(gt, dtype=np.float64)
+    dist1, idx1 = cKDTree(P).query(G, k=1, workers=-1)   # idx1 indexes P
+    dist2, idx2 = cKDTree(G).query(P, k=1, workers=-1)   # idx2 indexes G
+
+    out = {
+        "DCD": _dcd_numpy(dist1, dist2, idx1, idx2, len(P), len(G)),
+        # matches msn_skullfix.calc_cd's cd_t: mean of each direction, summed
+        "CD_t_mm": (dist1.mean() + dist2.mean()) * scale_mm,
+        "HD95_mm": max(np.percentile(dist1, 95), np.percentile(dist2, 95)) * scale_mm,
+    }
+    for t in F1_THRESHOLDS:
+        rec = float((dist1 < t).mean())          # of the real surface, how much covered
+        prec = float((dist2 < t).mean())         # of what was drawn, how much is real
+        out[f"F1@{t:g}"] = 2 * prec * rec / max(prec + rec, 1e-12)
+        if t == F1_THRESHOLDS[0]:
+            out["precision"], out["recall"] = prec, rec
+
+    if inp is not None:
+        out.update(_defect_metrics(P, G, np.asarray(inp, dtype=np.float64),
+                                   dist1, scale_mm, gt_mask=defect_mask))
+    return out
+
+
+def _defect_metrics(P, G, I, dist1, scale_mm, gt_mask=None, defect_mm=None):
+    """The same metrics, restricted to the region the input does not already show.
+
+    Only about 6% of ground-truth points lie in the defect; the rest is surface
+    the model was handed and merely has to reproduce, so whole-cloud numbers are
+    dominated by copying. A model that reproduced the visible surface perfectly
+    while filling the hole with garbage would still score well.
+
+    `gt_mask` is the normal way to call this, carrying the implant ground truth.
+    Leaving it None falls back to the old distance rule, kept only so the two can
+    be compared -- do not report numbers from the fallback beside numbers from the
+    labels.
+
+    The two masks are different on purpose. On the ground-truth side a point is
+    in the defect if it sits on the implant. On the prediction side a point is in
+    the defect if it is within DEFECT_MM of a defect ground-truth point -- the
+    "far from input" rule does NOT work there, because a prediction floating above
+    intact bone also satisfies it, so that version measured how far predictions
+    drift off the surface, which other columns already cover.
+
+    That is not circular: the region is a fact about (input, ground truth), and
+    the prediction never enters its definition. Restricting a metric to a
+    truth-derived band and scoring predictions inside it is what boundary DSC
+    does too.
+
+    Reported per direction, because the two carry different weight:
+
+      coverage (gt -> pred)   of the missing surface, how close the nearest
+                              predicted point is. Cannot be gamed -- ignoring the
+                              hole makes it worse. This is the column that
+                              discriminates between configurations.
+      precision (pred -> gt)  of the points placed in the defect, how close they
+                              are to the real surface. Every configuration lands
+                              within a few hundredths of a millimetre, so it does
+                              NOT discriminate: models differ in how completely
+                              they cover the hole, not how accurately they fill
+                              it. It is also gameable by placing no points there,
+                              hence n_pred.
+    """
+    from scipy.spatial import cKDTree
+
+    thr = (DEFECT_MM if defect_mm is None else defect_mm) / scale_mm   # mm -> normalised
+    if gt_mask is None:
+        gt_mask = cKDTree(I).query(G, k=1, workers=-1)[0] > thr
+
+    out = {"defect_gt_%": 100.0 * gt_mask.mean()}
+    if not gt_mask.any():                            # no hole found: leave blank
+        return {**out, "defect_n_pred": 0, "defect_cov_mm": np.nan,
+                "defect_HD95_mm": np.nan, "defect_prec_mm": np.nan,
+                "defect_F1@0.05": np.nan}
+
+    cov = dist1[gt_mask]                             # reuse: gt -> nearest pred
+    out["defect_cov_mm"] = float(cov.mean()) * scale_mm
+    out["defect_HD95_mm"] = float(np.percentile(cov, 95)) * scale_mm
+
+    pr_mask = cKDTree(G[gt_mask]).query(P, k=1, workers=-1)[0] < thr
+    out["defect_n_pred"] = int(pr_mask.sum())
+
+    if pr_mask.any():
+        # Target is the FULL ground truth, not just its defect points. Restricting
+        # it inflates the number badly (measured 12-16 mm): a predicted point at
+        # the edge of the hole has its nearest real surface just outside the
+        # defect, and excluding those forces it to match something much further
+        # in. The question here is "is this point on the skull at all", and the
+        # skull is all of G.
+        d_pr = cKDTree(G).query(P[pr_mask], k=1, workers=-1)[0]
+        out["defect_prec_mm"] = float(d_pr.mean()) * scale_mm
+        t = F1_THRESHOLDS[0]
+        r, pr = float((cov < t).mean()), float((d_pr < t).mean())
+        out["defect_F1@0.05"] = 2 * pr * r / max(pr + r, 1e-12)
+    else:                                            # nothing placed in the hole
+        out["defect_prec_mm"] = np.nan
+        out["defect_F1@0.05"] = 0.0
+    return out
+
+
+def arch_config(msn, arch):
+    """Rebuild the MSNConfig a run was trained with, from its arch_key."""
+    name, per_point, use_text, tie_qk = arch
+    try:
+        cfg = getattr(msn.MSNConfig, name)()
+    except AttributeError:
+        raise ValueError(f"run.json names an unknown config {name!r}") from None
+    if per_point:
+        # Guards the one-way failure: a run trained with per-point decoder keys
+        # being evaluated by a checkout that predates the option. Silently
+        # falling back to the replicated global vector would load the weights
+        # fine and report numbers for the wrong network.
+        if not hasattr(cfg, "per_point_attn"):
+            raise ValueError(
+                "this run was trained with per_point_attn=True but msn_skullfix "
+                "has no such option -- check out the code version that matches it")
+        cfg.per_point_attn = True
+    cfg.use_text = use_text
+    if tie_qk and not hasattr(cfg, "tie_qk_init"):
+        raise ValueError("this run was trained with tie_qk_init=True but msn_skullfix has no "
+                         "such option -- check out the code version that matches it")
+    cfg.tie_qk_init = tie_qk
+    return cfg
+
+
+def eval_runs(repo, runs, n_skulls=None, device="/GPU:0", data=None):
+    """Per-skull metrics for every run, on that run's own validation split.
+
+    Returns a long-form DataFrame: one row per (run, skull). Millimetre columns
+    use each skull's own scale, not the dataset mean.
+
+    CD_p is deliberately absent. Its definition -- sqrt of a MEAN DISTANCE --
+    takes the square root of a length, so it has no meaningful unit. The bug is
+    inherited verbatim from the source project; the value is not reported here.
+    """
+    import sys
+    sys.path.insert(0, os.path.join(repo, "src", "models"))
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    import tensorflow as tf
+    for g in tf.config.experimental.list_physical_devices("GPU"):
+        tf.config.experimental.set_memory_growth(g, True)
+    import msn_skullfix as msn
+    import mesh_viz as mv
+
+    data = np.load(data or os.path.join(repo, DATA_CACHE))
+    ids, inputs, gt, scales = data["ids"], data["inputs"], data["gt"], data["scale_mm"]
+    # Only needed by text-branch runs; a no-text checkout may not have cached it.
+    text_path = os.path.join(repo, BERT_CACHE)
+    text = np.load(text_path) if os.path.exists(text_path) else None
+
+    # One model per ARCHITECTURE, reused across the runs that share it. Building a
+    # fresh 187M-parameter model per run exhausted a 24 GB card at the fourth one:
+    # `del model` + clear_session() does not make TF's allocator hand memory back,
+    # so each rebuild stacked.
+    #
+    # Grouping, rather than asserting a single architecture, is what keeps a
+    # cross-architecture comparison honest. `load_weights` will NOT protect you
+    # here: changing where the decoder's keys come from leaves every weight SHAPE
+    # untouched (only the key sequence length moves), so an old checkpoint loads
+    # into the new topology without raising, and quietly reports numbers for a
+    # network that was never trained. Same failure mode as the MSN_weights3.h5
+    # mismatch documented in msn_skullfix -- shapes agree, meaning does not.
+    groups = {}
+    for r in runs:
+        groups.setdefault(r.arch_key, []).append(r)
+    if len(groups) > 1:
+        print(f"[eval_runs] {len(groups)} architectures present, one model each: "
+              + ", ".join(f"{k[0]}{'+pp_attn' if k[1] else ''} x{len(v)}"
+                          for k, v in groups.items()))
+
+    # Implant ground truth for the defect region. Loaded up front so a missing
+    # skull fails before any GPU work rather than 15 minutes into it.
+    labels = defect_labels(repo)
+
+    rows = []
+    with tf.device(device):
+        for arch, group in groups.items():
+            cfg = arch_config(msn, arch)
+            if cfg.use_text and text is None:
+                raise FileNotFoundError(
+                    f"{group[0].label} was trained with the text branch, but "
+                    f"{text_path} is missing")
+            model = msn.build_model(cfg)
+            for run in group:
+                model.load_weights(run.weights)
+                val = run.meta["val_ids"][:n_skulls] if n_skulls else run.meta["val_ids"]
+                missing = [s for s in val if s not in labels]
+                if missing:
+                    raise SystemExit(
+                        f"{run.label}: no defect ground-truth labels for these skulls: "
+                        f"{missing}\n"
+                        f"run first: python src/eval/make_defect_labels.py")
+                pos = [int(np.where(ids == sid)[0][0]) for sid in val]
+                # model.predict, NOT model(x) in a loop. Measured: calling the model
+                # directly on one sample at a time leaks 0.29 GiB per call and never
+                # returns it, so 80 skulls exhausts a 24 GB card partway through the
+                # fourth run. predict() holds flat at 0.78 GiB across any number of
+                # batches.
+                x = [inputs[pos]]
+                if cfg.use_text:
+                    x.append(np.tile(text[None], (len(pos), 1)))
+                preds = model.predict(x, batch_size=1, verbose=0)
+                for sid, i, p in zip(val, pos, preds):
+                    s = float(scales[i])
+                    row = {"run": run.label, "id": sid}
+                    row.update(metrics_from_points(p, gt[i], s, inp=inputs[i],
+                                                   defect_mask=labels[sid]))
+                    st = mv.surface_stats(p, gt[i], s)
+                    row["clump_%"] = st["clump_pct"]
+                    row["spacing_CV"] = st["spacing_cv"]
+                    rows.append(row)
+                print(f"  {run.label}: {len(val)} skulls")
+    return pd.DataFrame(rows)
+
+
+SUMMARY_COLS = ["CD_t_mm", "HD95_mm", "F1@0.05", "F1@0.03", "DCD", "clump_%", "spacing_CV"]
+# Reported as a separate table: mixing them into the one above invites reading a
+# whole-cloud number and a defect-only number off the same row as if comparable.
+DEFECT_COLS = ["defect_cov_mm", "defect_HD95_mm", "defect_prec_mm",
+               "defect_F1@0.05", "defect_gt_%", "defect_n_pred"]
+LOWER_IS_BETTER = {"CD_t_mm", "HD95_mm", "DCD", "clump_%", "spacing_CV",
+                   "defect_cov_mm", "defect_HD95_mm", "defect_prec_mm"}
+
+
+def summarise(df):
+    """Mean per run, in the order the runs were given."""
+    order = list(dict.fromkeys(df["run"]))
+    out = df.groupby("run")[SUMMARY_COLS].mean().loc[order]
+    return out.round(4)
+
+
+def format_defect_summary(df):
+    """The defect-region table. Kept separate from format_summary on purpose --
+    these millimetres are one-directional and cover 6.7% of the surface, so
+    reading them on the same row as the whole-cloud numbers would invite treating
+    a 12 mm coverage error as if it were four times worse than a 6 mm CD_t."""
+    cols = [c for c in DEFECT_COLS if c in df.columns]
+    if not cols:
+        return "(no defect-region columns -- pass inp= to metrics_from_points)"
+    order = list(dict.fromkeys(df["run"]))
+    s = df.groupby("run")[cols].mean().loc[order]
+    lines = [f"{'run':<20}" + "".join(f"{c:>16}" for c in cols),
+             "-" * (20 + 16 * len(cols))]
+    for name, r in s.iterrows():
+        lines.append(f"{name:<20}" + "".join(f"{r[c]:>16.3f}" for c in cols))
+    return "\n".join(lines)
+
+
+def format_summary(df, gt_row=None):
+    """Plain-text table for a slide or the terminal."""
+    s = summarise(df)
+    lines = [f"{'run':<20}" + "".join(f"{c:>12}" for c in SUMMARY_COLS)]
+    lines.append("-" * len(lines[0]))
+    for name, r in s.iterrows():
+        lines.append(f"{name:<20}" + "".join(f"{r[c]:>12.4f}" for c in SUMMARY_COLS))
+    if gt_row is not None:
+        lines.append("-" * len(lines[0]))
+        lines.append(f"{'ground truth':<20}" +
+                     "".join(f"{gt_row.get(c, float('nan')):>12.4f}" for c in SUMMARY_COLS))
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# is the difference real?
+# --------------------------------------------------------------------------- #
+# THREE DIFFERENT YARDSTICKS, AND THEY ANSWER THREE DIFFERENT QUESTIONS. Mixing
+# them up is how this project came to describe a coin-flip as "10x the noise".
+#
+#   1. repeat-run difference   train the SAME config twice and compare the means.
+#      Answers: "if I retrain this, does the number move?" -- i.e. training
+#      stochasticity (GPU non-determinism, the stochastic centroid sampler).
+#      Measured here at 0.004 mm CD_t, but from ONE pair in ONE config, and it is
+#      epoch-dependent: the same pair differs by 0.108 mm if you cut both at 150
+#      epochs, 0.007 mm once both have annealed. It is NOT a universal floor.
+#
+#   2. per-skull paired test   `paired_stats` below. Answers: "would this still
+#      hold on a different sample of skulls?" -- i.e. generalisation past these
+#      20. This is the one a thesis examiner is asking about, and it is the one
+#      that was missing: several differences that are large against (1) are a
+#      coin flip against (2).
+#
+#   3. late-epoch wobble       std of val CD_t over the last ~30 epochs. Answers:
+#      "how much does the reported best-of-run reading jitter?" Small once the LR
+#      has annealed (0.003-0.010 mm), large when it has not (~0.25 mm, which is
+#      what voided the four pre-LR-fix runs).
+#
+# None of the three covers the others. A claim is safe when it clears (1) and
+# (2); `epoch_matched` below removes a fourth confound that is not noise at all.
+def epoch_matched(runs, at=None):
+    """Best-so-far val CD_t at a COMMON epoch count, for every run.
+
+    Runs stop themselves (EarlyStopping), so they stop at different epochs --
+    222 to 411 across this project -- while the headline number is the best epoch
+    of the whole run. A configuration that happens to keep improving longer
+    therefore reports a better number partly because it ran longer, which is a
+    systematic confound, not noise. Measured: `tie_qk`'s 0.095 mm lead over
+    `cd_rep05_full` shrinks to 0.02-0.03 mm when both are cut at 249 epochs, and
+    two thirds of its advantage is the 160 extra epochs.
+
+    Reading it: if a configuration is still ahead at the shortest common epoch
+    count, the effect is the configuration. If the lead only appears at its own
+    stopping point, what you measured is "this run trained longer" -- which can
+    still be a real property of the configuration, but it is a different claim
+    and needs the repeat to tell the two apart.
+
+    `at`: epoch counts to report. Defaults to the shortest run in the set.
+    """
+    at = at or [min(len(r.hist) for r in runs)]
+    rows = []
+    for r in runs:
+        cd = (r.hist["val_cd_t_metric"] * r.scale_mm).to_numpy()
+        row = {"run": r.label, "epochs": len(cd), "best_epoch": int(cd.argmin()) + 1,
+               "reported": float(cd.min())}
+        for ep in at:
+            row[f"@{ep}"] = float(cd[:ep].min()) if len(cd) >= ep else np.nan
+        row["late_std"] = float(cd[-30:].std())
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("run").round(4)
+
+
+def paired_stats(df, base, other, cols=None):
+    """Per-skull paired comparison of two runs, on the skulls they share.
+
+    Every run here is evaluated on the SAME 20 validation skulls, so the skulls
+    pair up exactly and "this skull is intrinsically harder" cancels out -- which
+    matters, because between-skull spread (CD_t std ~1.0 mm) dwarfs every effect
+    being chased (0.02-0.2 mm). Comparing two means without pairing would drown
+    all of them.
+
+    Returns, per metric: the mean difference (other - base, signed so that
+    `better` counts improvements in that metric's own direction), the paired
+    standard error, a 95% interval, how many skulls improved, and two p-values --
+    a sign test (does it improve MORE skulls than chance) and Wilcoxon signed-rank
+    (are the magnitudes consistent too). The sign count is often the more useful
+    column: `repulsion` improves defect coverage on 18/20 skulls, which is far
+    more convincing than its mean, whose interval is wide.
+
+    ⚠️ This holds the two TRAINED MODELS fixed and varies the skulls. It cannot
+    see training stochasticity: retrain either config and you get a slightly
+    different model. A claim needs both this and a repeat run (see the note
+    above). ⚠️ Running many of these invites multiple-comparison error -- with
+    ~24 tests, treat p < 0.002 as the safe bar, not p < 0.05.
+    """
+    from scipy import stats
+
+    cols = cols or [c for c in SUMMARY_COLS + DEFECT_COLS
+                    if c in df.columns and c not in ("defect_gt_%", "defect_n_pred")]
+    piv = df.pivot(index="id", columns="run")
+    rows = []
+    for c in cols:
+        d = (piv[c][other] - piv[c][base]).dropna()
+        n = len(d)
+        if n < 2:
+            continue
+        m, se = float(d.mean()), float(d.std(ddof=1) / np.sqrt(n))
+        better = int((d < 0).sum() if c in LOWER_IS_BETTER else (d > 0).sum())
+        try:
+            p_w = float(stats.wilcoxon(d).pvalue)
+        except ValueError:                      # all differences exactly zero
+            p_w = np.nan
+        rows.append({"metric": c, "delta": m, "paired_se": se,
+                     "ci_lo": m - 1.96 * se, "ci_hi": m + 1.96 * se,
+                     "better": f"{better}/{n}",
+                     "p_sign": float(stats.binomtest(better, n, 0.5).pvalue),
+                     "p_wilcoxon": p_w})
+    return pd.DataFrame(rows).set_index("metric").round(4)
+
+
+def format_paired(df, base, other, cols=None):
+    """paired_stats as a plain-text table, with the direction spelled out."""
+    s = paired_stats(df, base, other, cols)
+    head = (f"{other}  vs  {base}   (paired per skull; delta = {other} - {base})\n"
+            f"{'metric':24}{'delta':>10}{'paired SE':>11}{'95% CI':>21}"
+            f"{'better':>8}{'p_sign':>9}{'p_wilcox':>10}")
+    lines = [head, "-" * len(head.split("\n")[-1])]
+    for m, r in s.iterrows():
+        arrow = "(lower)" if m in LOWER_IS_BETTER else "(higher)"
+        ci = f"[{r['ci_lo']:+.3f},{r['ci_hi']:+.3f}]"
+        star = "  ***" if r["p_wilcoxon"] < 0.001 else ("  **" if r["p_wilcoxon"] < 0.01
+               else ("  *" if r["p_wilcoxon"] < 0.05 else ""))
+        lines.append(f"{m + ' ' + arrow:24}{r['delta']:>+10.3f}{r['paired_se']:>11.3f}"
+                     f"{ci:>21}{r['better']:>8}{r['p_sign']:>9.4f}{r['p_wilcoxon']:>10.4f}{star}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# k-fold: aggregating across folds
+# --------------------------------------------------------------------------- #
+# `paired_stats` DOES NOT WORK UNDER K-FOLD, and this block is what replaces it.
+# It pairs two runs skull by skull, which is only possible because every
+# single-split run in this project validates on the same 20 skulls. Fold 0 and
+# fold 1 validate on disjoint skulls, so there is nothing to pair.
+#
+# The replacement is the FOLD MEAN: each fold contributes one number per config,
+# and those k numbers pair across configs because both sides used the same
+# partition. Three consequences, all worth knowing BEFORE an 18-20 hour run:
+#
+#   * k = 5 sets the resolution, and it was estimated in advance:
+#     training variance ~0.15 mm, so the standard error of a 5-fold
+#     mean DIFFERENCE is about 0.15*sqrt(2)/sqrt(5) ~ 0.09 mm, against a 2x2
+#     effect of 0.20-0.24 mm -- t ~ 2. Enough, not comfortable. Report anything
+#     under 0.1 mm as no measurable difference. If a cell lands on the edge, the
+#     fix is repeating the key cells WITHIN each fold, not adding folds: more
+#     folds shrink the split variance, not the training variance.
+#
+#   * The project's p < 0.002 bar is UNREACHABLE at fold level. Five paired
+#     values give a smallest possible sign-test p of 0.0625, so no rank test on
+#     folds can ever clear it -- the same arithmetic that capped the n=8
+#     roughness and point-to-surface comparisons. Read `t` and `better` instead;
+#     the k-fold form of the decision list is "all k folds agree AND
+#     |delta| > 2*se", not a p-value.
+#
+#   * Pooling all 100 skulls is ruler (2), NOT significance for the config.
+#     Each skull is validated exactly once per config, so
+#         paired_stats(fdf.assign(run=fdf["config"]), base, other)
+#     is a legitimate 100-skull paired test of "would this hold on other
+#     skulls". Its p-value is ANTI-CONSERVATIVE for "is this config better",
+#     because the 20 skulls inside one fold share a single trained model and
+#     their residuals are correlated. Quote it as generalisation evidence,
+#     never as the effect's significance.
+_FOLD_TAG = re.compile(r"^(?P<config>.+?)[_-]f(?P<fold>\d+)$")
+
+
+def fold_frame(df, runs):
+    """`eval_runs` output plus `config` and `fold` columns, preconditions checked.
+
+    `runs` is the authority: the fold index is read from each run.json and the
+    run NAME is only cross-checked against it. Deriving it from the name alone
+    would put an 18-hour experiment at the mercy of a typo in --run-name, and
+    this project has already lost a checkpoint to exactly that. Name fold runs
+    `<config>_f<fold>`, e.g. `cd_rep05_full_f0`.
+
+    Every precondition raises rather than warns, because each one makes the
+    aggregate silently wrong rather than visibly broken:
+      * a single-split run mixed in (its 20 skulls would be counted as a fold)
+      * two configs on different partitions (the fold means would not pair)
+      * a config missing a fold, or a fold appearing twice
+      * two defect-region definitions in one frame -- 5 mm rows and implant rows
+        average into a number that describes neither (see `defect_def`)
+    """
+    index, n_folds, val_ids = {}, set(), {}
+    for r in runs:
+        nf = int(r.meta.get("n_folds") or 0)
+        if nf <= 0:
+            raise ValueError(
+                f"{r.label}: run.json records n_folds={nf}, so this is a single-split run. "
+                f"Its validation set corresponds to no fold, and including it would count "
+                f"as one in the means.")
+        n_folds.add(nf)
+        fold = r.meta.get("fold")
+        m = _FOLD_TAG.match(r.label)
+        if m is None:
+            raise ValueError(
+                f"{r.label}: no fold number in the run name. Name cross-validation runs "
+                f"<config>_f<fold>, for example cd_rep05_full_f{fold}.")
+        if int(m.group("fold")) != int(fold):
+            raise ValueError(
+                f"{r.label}: the name says fold {m.group('fold')} while run.json records "
+                f"fold={fold}. run.json is authoritative -- rename the run, do not edit it.")
+        key = (m.group("config"), int(fold))
+        index[r.label] = key
+        val_ids[key] = tuple(r.meta["val_ids"])
+    if len(n_folds) != 1:
+        raise ValueError(f"mixed --n-folds values: {sorted(n_folds)}; these cannot be "
+                         f"aggregated together")
+    k = n_folds.pop()
+
+    configs = sorted({c for c, _ in index.values()})
+    for c in configs:
+        got = sorted(f for cc, f in index.values() if cc == c)
+        if got != list(range(k)):
+            raise ValueError(f"{c}: folds are {got}, expected 0..{k - 1} exactly once each")
+    for f in range(k):
+        if len({tuple(sorted(val_ids[(c, f)])) for c in configs}) != 1:
+            raise ValueError(
+                f"fold {f}: the configurations validate on different skulls, so their fold "
+                f"means cannot be paired.\n"
+                f"Every cell has to be run with the same seed and the same --n-folds.")
+    seen = [i for f in range(k) for i in val_ids[(configs[0], f)]]
+    if len(seen) != len(set(seen)):
+        raise ValueError("one configuration's folds validate on overlapping skulls -- this "
+                         "is not a clean partition")
+
+    unknown = sorted(set(df["run"]) - set(index))
+    if unknown:
+        raise ValueError(f"these runs are not in `runs`, so their fold is unknown: {unknown}")
+    if "defect_def" in df.columns:
+        defs = sorted(df["defect_def"].dropna().unique())
+        if len(defs) > 1:
+            raise ValueError(
+                f"the frame holds two defect-region definitions {defs}; filter on "
+                f"defect_def before aggregating")
+        if df["defect_def"].isna().any():
+            raise ValueError("some rows have an empty defect_def, so their definition "
+                             "cannot be confirmed")
+
+    out = df.copy()
+    out["config"] = [index[r][0] for r in out["run"]]
+    out["fold"] = [index[r][1] for r in out["run"]]
+    return out
+
+
+def fold_summary(fdf, cols=None):
+    """Per config and metric: the k fold means, and their mean / std / SE.
+
+    Long form -- one row per (metric, config) -- because the wide form needs a
+    column MultiIndex and this gets read in a terminal. `mean` is the number a
+    thesis reports, `std_folds` the spread reported beside it, `se` what a
+    difference has to beat.
+    """
+    cols = cols or [c for c in SUMMARY_COLS + DEFECT_COLS if c in fdf.columns]
+    per_fold = fdf.groupby(["config", "fold"])[cols].mean()
+    rows = []
+    for c in cols:
+        for cfg, s in per_fold[c].groupby(level="config"):
+            n = int(s.notna().sum())
+            sd = float(s.std(ddof=1)) if n > 1 else float("nan")
+            rows.append({"metric": c, "config": cfg, "folds": n,
+                         "mean": float(s.mean()), "std_folds": sd,
+                         "se": sd / np.sqrt(n) if n > 1 else float("nan")})
+    return pd.DataFrame(rows).set_index(["metric", "config"]).round(4)
+
+
+def fold_paired(fdf, base, other, cols=None):
+    """Fold-level paired comparison of two configs -- the k-fold `paired_stats`.
+
+    Pairs the configs FOLD BY FOLD, which is what makes it valid: fold i is the
+    same skulls on both sides, so "this fold happens to hold the hard skulls"
+    cancels the way per-skull pairing cancels "this skull is hard". Each fold
+    contributes one difference, so n = k -- five, not a hundred.
+
+    Per metric: the mean difference (other - base), its standard error across
+    folds, a t-based 95% interval (NOT 1.96 -- at k=5 that is 40% too narrow),
+    how many folds moved in the improving direction, and the paired t on the
+    fold means. `t` is the column to read: it is delta/se, and the plan written
+    before the run expected t ~ 2 for the 2x2 cells.
+
+    ⚠️ No Wilcoxon here, deliberately. At k=5 its smallest attainable p is
+    0.0625, so reporting it would only invite reading "not significant" off a
+    test that cannot be significant.
+    """
+    from scipy import stats
+
+    cols = cols or [c for c in SUMMARY_COLS + DEFECT_COLS
+                    if c in fdf.columns and c not in ("defect_gt_%", "defect_n_pred")]
+    per_fold = fdf.groupby(["config", "fold"])[cols].mean()
+    have = set(per_fold.index.get_level_values("config"))
+    for name in (base, other):
+        if name not in have:
+            raise ValueError(f"no such configuration: {name}; the frame holds "
+                             f"{sorted(have)}")
+    a = per_fold.xs(base, level="config")
+    b = per_fold.xs(other, level="config")
+    folds = a.index.intersection(b.index)
+    rows = []
+    for c in cols:
+        d = (b.loc[folds, c] - a.loc[folds, c]).dropna()
+        n = len(d)
+        if n < 2:
+            continue
+        m = float(d.mean())
+        se = float(d.std(ddof=1) / np.sqrt(n))
+        tcrit = float(stats.t.ppf(0.975, n - 1))
+        better = int((d < 0).sum() if c in LOWER_IS_BETTER else (d > 0).sum())
+        rows.append({"metric": c, "delta": m, "fold_se": se,
+                     "ci_lo": m - tcrit * se, "ci_hi": m + tcrit * se,
+                     "t": m / se if se > 0 else float("nan"),
+                     "p_t": float(stats.ttest_rel(b.loc[folds, c],
+                                                  a.loc[folds, c]).pvalue),
+                     "better": f"{better}/{n}"})
+    return pd.DataFrame(rows).set_index("metric").round(4)
+
+
+def format_fold_paired(fdf, base, other, cols=None):
+    """fold_paired as a plain-text table, with the k=5 caveat in the header."""
+    s = fold_paired(fdf, base, other, cols)
+    k = int(fdf["fold"].nunique())
+    head = (f"{other}  vs  {base}   (paired over {k} folds; delta = {other} - {base})\n"
+            f"Warning: at n={k} the smallest attainable sign-test p is "
+            f"{2 * 0.5 ** k:.4f}, short of this project's bar. Read `t` and how many folds "
+            f"agree; the criterion is every fold in the same direction AND "
+            f"|delta| > 2 x SE\n"
+            f"{'metric':24}{'delta':>10}{'fold SE':>10}{'95% CI(t)':>21}"
+            f"{'t':>8}{'p_t':>9}{'better':>8}")
+    lines = [head, "-" * len(head.split("\n")[-1])]
+    for m, r in s.iterrows():
+        arrow = "(lower)" if m in LOWER_IS_BETTER else "(higher)"
+        ci = f"[{r['ci_lo']:+.3f},{r['ci_hi']:+.3f}]"
+        flat = "  <- under 0.1mm, read as no measurable difference" \
+            if abs(r["delta"]) < 0.1 and "mm" in m else ""
+        lines.append(f"{m + ' ' + arrow:24}{r['delta']:>+10.3f}{r['fold_se']:>10.3f}"
+                     f"{ci:>21}{r['t']:>8.2f}{r['p_t']:>9.4f}{r['better']:>8}{flat}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# figures
+# --------------------------------------------------------------------------- #
+def fig_curves(runs, scale_mm=None, height=400, settle_epoch=20):
+    """Training curves: loss, CD_t in mm, and clump %, with LR drops marked.
+
+    The LR markers are the point of this figure. Every run before 2026-08-07 has
+    none, because ReduceLROnPlateau's patience was larger than EarlyStopping's
+    and it never fired -- and fixing that was worth more than any loss change.
+
+    Y ranges are taken from epoch `settle_epoch` onwards. Autoscaling includes
+    the start-up transient -- CD_t begins near 165 mm and settles around 6 -- so
+    an autoscaled axis renders every run as the same flat line at the bottom and
+    hides the entire result. The transient is still drawn, just clipped.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    has_clump = any("val_clump_metric" in r.hist for r in runs)
+    # Only runs trained after 2026-08-25 carry this: it is the metric the thesis
+    # reports, logged every --defect-every epochs purely so that "had this run
+    # converged on the number that matters?" is answerable. Sampled, so most rows
+    # are NaN and each trace is drawn from its own non-NaN subset.
+    has_defect = any("val_defect_cov_mm" in r.hist for r in runs)
+    titles = (["Loss", "val CD_t (mm)"]
+              + (["val clumping <2mm (%)"] if has_clump else [])
+              + (["val defect coverage (mm)"] if has_defect else []))
+    fig = make_subplots(rows=1, cols=len(titles), subplot_titles=titles)
+
+    series = [("val_loss", 1)] + [("val_cd_t_metric", None)] + \
+             ([("val_clump_metric", 100)] if has_clump else []) + \
+             ([("val_defect_cov_mm", 1)] if has_defect else [])
+    settled = {k: [] for k, _ in series}
+
+    for n, run in enumerate(runs):
+        c = C_SERIES[n % len(C_SERIES)]
+        s = scale_mm or run.scale_mm
+        show = True
+        for col, (key, mul) in enumerate(series, start=1):
+            if key not in run.hist:
+                continue
+            y = run.hist[key] * (s if mul is None else mul)
+            ok = y.notna()
+            if not ok.any():
+                continue
+            settled[key].append(y[ok][settle_epoch:])
+            fig.add_trace(go.Scatter(x=y.index[ok] + 1, y=y[ok], name=run.label,
+                                     mode="lines+markers" if ok.sum() < len(y) else "lines",
+                                     marker=dict(size=4),
+                                     line=dict(color=c, width=1.6), legendgroup=run.label,
+                                     showlegend=show), row=1, col=col)
+            show = False
+        for ep in run.lr_drops:
+            fig.add_vline(x=ep, line=dict(color=c, width=0.8, dash="dot"),
+                          opacity=0.45, row=1, col=2)
+
+    for col, (key, _) in enumerate(series, start=1):
+        vals = np.concatenate([v for v in settled[key] if len(v)]) if settled[key] else None
+        if vals is None or not len(vals):
+            continue
+        lo, hi = float(np.min(vals)), float(np.percentile(vals, 99))
+        pad = max((hi - lo) * 0.08, 1e-9)
+        fig.update_yaxes(range=[max(0.0, lo - pad), hi + pad], row=1, col=col)
+
+    fig.update_xaxes(title_text="epoch")
+    note = "dotted = learning-rate drop" if any(r.lr_drops for r in runs) else \
+           "no learning-rate drops: ReduceLROnPlateau never fired in these runs"
+    fig.update_layout(height=height,
+                      title=f"Validation curves ({note}; y-axis from epoch {settle_epoch})",
+                      legend=dict(orientation="h", y=-0.18), margin=dict(t=80, b=70))
+    return fig
+
+
+def fig_progress(df, baseline=None, height=380):
+    """One bar per run per metric, normalised so 'better' always points down.
+
+    For a progress report: shows at a glance which metrics moved and which did
+    not. Bars are % change against `baseline` (defaults to the first run).
+    """
+    import plotly.graph_objects as go
+
+    s = summarise(df)
+    base = baseline or s.index[0]
+    fig = go.Figure()
+    for n, m in enumerate(SUMMARY_COLS):
+        b = s.loc[base, m]
+        if not np.isfinite(b) or b == 0:
+            continue
+        vals = (s[m] - b) / abs(b) * 100
+        if m not in LOWER_IS_BETTER:      # flip so down = better everywhere
+            vals = -vals
+        fig.add_trace(go.Bar(x=s.index, y=vals, name=m,
+                             marker_color=C_SERIES[n % len(C_SERIES)]))
+    fig.add_hline(y=0, line=dict(color="#666", width=1))
+    fig.update_layout(barmode="group", height=height,
+                      title=f"Change vs {base} — negative is better (all metrics flipped)",
+                      yaxis_title="% change", legend=dict(orientation="h", y=-0.22),
+                      margin=dict(t=60, b=80))
+    return fig
+
+
+def fig_per_skull(df, metric="CD_t_mm", height=380):
+    """Per-skull spread, so a mean is never read as if it were the whole story.
+
+    Run-to-run variance was measured at 0.49 mm on this setup, which is larger
+    than most of the differences being compared -- this figure is what stops a
+    within-noise gap being presented as an improvement.
+    """
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    for n, run in enumerate(dict.fromkeys(df["run"])):
+        d = df[df["run"] == run]
+        fig.add_trace(go.Box(y=d[metric], name=run, boxpoints="all", jitter=0.4,
+                             pointpos=0, marker=dict(color=C_SERIES[n % len(C_SERIES)], size=5),
+                             line=dict(color=C_SERIES[n % len(C_SERIES)])))
+    fig.update_layout(height=height, yaxis_title=metric, showlegend=False,
+                      title=f"{metric} per validation skull (n={df.groupby('run').size().iloc[0]})",
+                      margin=dict(t=60))
+    return fig

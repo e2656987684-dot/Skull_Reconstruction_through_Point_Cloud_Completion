@@ -1,0 +1,485 @@
+"""Surface-quality visualisation and diagnostics for predicted point clouds.
+
+Scatter plots of 6144 loose points make it hard to judge whether a predicted
+surface is any good. This turns a point cloud into a shaded mesh that can be
+read, adds the two diagnostics a mesh hides, and supplies the numbers that
+settle "did it really improve?".
+
+Warning: VISUALISATION ONLY -- never compute a metric on these meshes.
+Reconstruction inflates the shape, with the original points sitting a median
+5.3 mm (p95 12.0 mm) from the reconstructed surface. That is the same order as
+the model's own error, so a metric computed here would be dominated by
+reconstruction artefacts. Every Chamfer and DCD number comes from the raw point
+clouds.
+
+Warning: never tune RECON per figure when comparing runs. It is a module-level
+constant rather than a default argument you are invited to override, because
+every knob in it changes how smooth the result LOOKS -- tuning per figure lets a
+parameter change masquerade as a model improvement.
+
+Why these values, measured on these skulls:
+
+  radius_mm=6.0  Each point becomes a ball and the surface is the isosurface of
+      the distance field. Point spacing is 3.5-4.3 mm, and below about 4 mm the
+      balls stop touching and the skull renders as a sponge; the radius must also
+      stay well under the defect's extent or the hole gets bridged and the thing
+      being looked at disappears. 5-6 mm is the usable window.
+  sigma=2.5   Gaussian blur of the distance field, in voxels. Removes the
+      cobblestone bumps left by individual balls, without which real surface
+      waviness cannot be seen through the reconstruction's own texture.
+  taubin=60   Taubin mesh smoothing, NOT Laplacian: Laplacian shrinks the model
+      steadily with each iteration and Taubin does not.
+  res=128     Distance-field grid. 96 is faster and fine for a quick look.
+
+Counter-intuitive but measured: MORE smoothing makes model differences more
+visible, not less. At low smoothing both ground truth and prediction render as
+the same pile of balls and the artefact swamps the signal; the blur removes that
+texture and leaves the genuine low-frequency waviness, which is where predictions
+actually differ.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import trimesh
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
+from skimage import measure
+
+# Locked reconstruction settings -- see the module docstring before touching.
+RECON = {"res": 128, "radius_mm": 6.0, "sigma": 2.5, "taubin": 60, "pad": 0.14}
+
+# Named smoothing levels for LOOKING AT ONE MODEL, e.g.
+#   pc_to_mesh(pred, scale_mm, **PRESETS["raw"])
+# or all of them at once via fig_smoothing_ladder().
+#
+# These exist for exploring what a surface actually looks like. They are NOT for
+# comparing two models -- for that, leave the settings alone and let RECON apply,
+# or every figure is reconstructed differently and the comparison means nothing.
+#
+# "raw" is the honest view of where the points are and nothing else; because
+# each point becomes a ball, it mostly shows the reconstruction's own texture,
+# and ground truth looks just as lumpy as any prediction. Smoothing is what
+# removes that shared texture and leaves the differences between models.
+PRESETS = {
+    # no smoothing at all: ball-per-point, tight radius. Shows individual points
+    # and any clumping directly, at the cost of looking like gravel.
+    "raw":     {"radius_mm": 4.0, "sigma": 0.0, "taubin": 0},
+    # balls are bridged, but the cobblestone texture is still there
+    "light":   {"radius_mm": 5.0, "sigma": 1.0, "taubin": 15},
+    # the locked default, repeated here so ladders include it
+    "default": {"radius_mm": 6.0, "sigma": 2.5, "taubin": 60},
+    # aggressive: only gross shape survives. Useful to check overall form, but
+    # it will hide real surface defects too -- do not judge quality from this.
+    # ⚠️ sigma is in VOXELS, so this preset gets stronger as `res` drops. Below
+    # about res=96 it perforates a cranial vault: the blurred field rises above
+    # the isolevel across a thin shell and marching cubes opens a hole that is
+    # not in the points. Measured on GT skull 039, same preset, res only --
+    # Euler characteristic 0 at res=64 (holed) against 2 at res=128 (closed).
+    "heavy":   {"radius_mm": 7.0, "sigma": 4.0, "taubin": 120},
+}
+
+# Ground truth is farthest-point sampled, so its spacing is near-uniform and it
+# contains literally no pair closer than ~3.5 mm. Predictions are not, and the
+# fraction of points sitting on top of a neighbour is the clearest single number
+# for that gap (measured: 0.0% for GT vs 11.2% for the current model).
+CLUMP_MM = 2.0
+
+# Locked camera positions, for the same reason RECON is locked: a figure that
+# compares two things must use ONE of these throughout, or part of what you are
+# looking at is the viewpoint.
+#
+# ⭐ "default" does NOT show the defect, which is worth knowing before choosing.
+# Measured over six skulls (070 000 031 004 083 053), the implant sits in the
+# direction [0.011, 0.664, 0.747] from the skull centroid, and the six agree to
+# a pairwise dot product of 0.99 -- SkullFix cuts its defects in the same place
+# every time. The default camera's unit vector is [0.000, -0.794, 0.608], whose
+# dot product with that is -0.07: very nearly orthogonal, so the hole is edge-on
+# and a defective skull renders almost identically to a complete one.
+#
+# "defect" is 1.95x the measured direction. Use it for anything whose point is
+# "the hole is filled"; use "default" to stay consistent with the figures already
+# in reports/ (they were all made with it).
+CAMERAS = {
+    "default": dict(x=0.0, y=-1.5, z=1.15),
+    "defect": dict(x=0.02, y=1.30, z=1.46),
+    # The defect camera turned 39 deg in azimuth and lowered 18 deg (to 50 / 30), at
+    # the same distance: the opening stays in view while the side of the vault and
+    # the temporal region show, so a panel reads as a skull rather than a dome.
+    "defect_oblique": dict(x=1.088, y=1.297, z=0.977),
+    # Azimuth 225 deg, elevation 15 deg: the three-quarter view anatomy is read
+    # from -- orbit, zygomatic arch, temporal region and vault all visible at
+    # once, so two panels can be compared as skulls rather than as blobs.
+    # "default" and "defect" both look at the back of the head, where a cranium
+    # has no landmarks; picked by rendering an 8-azimuth x 2-elevation sweep.
+    "three_quarter": dict(x=-1.297, y=-1.297, z=0.492),
+}
+
+# Shading for every mesh figure. Named so a figure built outside fig_meshes can
+# match the rest of reports/ instead of carrying its own copy.
+MESH_LIGHTING = dict(ambient=0.42, diffuse=0.85, specular=0.12, roughness=0.85, fresnel=0.1)
+MESH_LIGHT_POSITION = dict(x=120, y=180, z=200)
+
+
+def pc_to_mesh(points, scale_mm, *, bounds=None, **overrides):
+    """Point cloud -> shaded-renderable mesh, via a KD-tree distance field.
+
+    Poisson reconstruction would be the usual choice and is deliberately not
+    used here: it needs per-point normals, which a predicted cloud does not
+    have and which are unreliable to estimate on a skull (a thin bone shell,
+    where inner and outer surface normals flip against each other), and it
+    tends to close the defect -- exactly the feature being inspected.
+
+    `overrides` take precedence over RECON, for exploring one model:
+
+        pc_to_mesh(pred, scale_mm)                      # locked default
+        pc_to_mesh(pred, scale_mm, sigma=0, taubin=0)   # no smoothing at all
+        pc_to_mesh(pred, scale_mm, **PRESETS["heavy"])  # named level
+
+    Knobs, and the ranges that behave sensibly at 4096-6144 points:
+      radius_mm  ball radius per point, 4-7. Below ~4 the balls stop touching
+          and the skull renders as a sponge; above ~8 the defect starts to be
+          bridged over and you lose it.
+      sigma      distance-field blur in voxels, 0-4. The main smoothness knob.
+      taubin     mesh smoothing passes, 0-120. Cheap; does not shrink the model.
+      res        grid size, 96 (fast) to 160 (fine). Cost is roughly res^3.
+      bounds     (lo, hi) grid corners, replacing the cloud's own box and `pad`.
+          Pass one shared box when panels must be reconstructed identically:
+          `sigma` is in voxels, so clouds with different extents otherwise get
+          different blur in millimetres.
+
+    Overriding for a single model is fine and useful. Overriding while comparing
+    models is not -- see the module docstring.
+    """
+    cfg = {**RECON, **overrides}
+    P = np.asarray(points, dtype=np.float64)
+    r = cfg["radius_mm"] / scale_mm
+
+    if bounds is None:
+        lo, hi = P.min(0) - cfg["pad"], P.max(0) + cfg["pad"]
+    else:
+        lo, hi = (np.asarray(b, dtype=np.float64) for b in bounds)
+        if (P < lo).any() or (P > hi).any():
+            raise ValueError("bounds do not contain the cloud; the surface would be clipped")
+    res = cfg["res"]
+    axes = [np.linspace(lo[i], hi[i], res) for i in range(3)]
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+
+    field = cKDTree(P).query(grid, workers=-1)[0].reshape(res, res, res)
+    if cfg["sigma"] > 0:
+        field = gaussian_filter(field, cfg["sigma"])
+
+    verts, faces, _, _ = measure.marching_cubes(field, level=r)
+    step = np.array([(hi[i] - lo[i]) / (res - 1) for i in range(3)])
+    mesh = trimesh.Trimesh(vertices=verts * step + lo, faces=faces)
+
+    # The isosurface picks up small detached blobs around outlying points; keep
+    # only the skull itself so they do not clutter the render.
+    parts = mesh.split(only_watertight=False)
+    if len(parts):
+        mesh = max(parts, key=lambda m: len(m.faces))
+    if cfg["taubin"]:
+        mesh = trimesh.smoothing.filter_taubin(mesh, iterations=cfg["taubin"])
+    return mesh
+
+
+def local_spacing(points, scale_mm):
+    """Distance from each point to its nearest neighbour, in mm."""
+    P = np.asarray(points, dtype=np.float64)
+    return cKDTree(P).query(P, k=2, workers=-1)[0][:, 1] * scale_mm
+
+
+def signed_deviation(pred, gt, scale_mm, k=24):
+    """Signed distance from each predicted point to the local ground-truth surface, mm.
+
+    ⛔ SUPERSEDED 2026-08-27 -- DO NOT QUOTE `dev_*` ANY MORE.
+      `point_to_surface.py` measures the same thing against the actual
+      triangulated surface instead of a fitted plane, on the same points, and the
+      two disagree materially: this overstates the median deviation by 1.64x
+      (2.329 vs 1.466 mm, all 8 skulls, range 1.11-2.07x) and the spread by 1.49x.
+
+      Worse than overstating, it is BLIND to surface offset. The plane is fitted
+      to the centroid of the 24 nearest ground-truth points, and that
+      neighbourhood spans both sheets of the shell (spread 8.72 mm at k=24
+      against a 5-7 mm shell), so the plane lands in the MIDDLE of the bone. What
+      the sign then reports is which sheet the point is nearer, not which side of
+      its own surface it is on -- so `outside_pct` comes out at 50% whatever the
+      prediction does. Measured: across eight skulls it moves only 47.1-53.5%
+      (std 2.24pp) while the exact measure moves 27.4-52.7% (std 9.34pp), and the
+      two disagree on the SIGN of the bias for 6 of 8 skulls.
+
+      Kept, not deleted, for two reasons: `surface_quality.csv` holds rows
+      (`baseline`) whose weights are gone and which can never be recomputed, so
+      removing this would orphan archived columns; and it needs only the cached
+      point clouds, where the replacement needs the raw nrrd and marching cubes.
+
+    Positive is outside the surface, negative inside. A local plane is fitted to
+    the k nearest ground-truth points and the residual taken along its normal,
+    so this separates "the surface is in the wrong place" from "the points are
+    unevenly spread", which the unsigned Chamfer distance mixes together.
+    """
+    P = np.asarray(pred, dtype=np.float64)
+    G = np.asarray(gt, dtype=np.float64)
+    idx = cKDTree(G).query(P, k=k, workers=-1)[1]
+    nb = G[idx]
+    centre = nb.mean(1)
+    X = nb - centre[:, None, :]
+    _, evec = np.linalg.eigh(np.einsum("nki,nkj->nij", X, X) / k)
+    normal = evec[:, :, 0]                      # smallest eigenvector = surface normal
+    return np.einsum("ni,ni->n", P - centre, normal) * scale_mm
+
+
+ROUGH_K = 16    # the neighbourhood the original 0.736/0.760 claim was made at
+
+
+def local_roughness(points, scale_mm, k=ROUGH_K):
+    """How far each point sits off the plane fitted to its own k neighbours, mm.
+
+    Returns (residual_mm, normal_spread_mm). The residual is the roughness
+    reading; the spread is how thick the neighbourhood itself is along that
+    normal, which is what says whether the reading can be trusted.
+
+    ⚠️ THIS METRIC IS CONTAMINATED AND THE CONTAMINATION CANNOT BE TUNED AWAY.
+      A skull is a shell 5-7 mm thick, so a neighbourhood large enough to fit a
+      plane to also reaches the OTHER surface, and the plane ends up straddling
+      both. Measured on ground truth: `normal_spread_mm` at k=24 is ~6 mm, i.e.
+      exactly the shell thickness. Going smaller does not escape it and going
+      larger swaps it for a different contaminant -- the skull's own curvature,
+      which at k=128 spans a ~23 mm patch. There is no clean k.
+      Absolute values are therefore NOT interpretable as "how rough
+      this surface is".
+
+      What survives is the COMPARISON. Applying an identically biased metric to
+      ground truth and to a prediction makes most of the bias common-mode, so
+      the difference between the two still carries information -- with the
+      caveat that the two clouds have different densities, so they are not
+      contaminated to quite the same degree.
+
+    The point being measured is excluded from the fit (`k + 1` neighbours, self
+    dropped). Including it would pull the plane toward the point and bias the
+    residual down by roughly 1/k.
+    """
+    P = np.asarray(points, dtype=np.float64)
+    idx = cKDTree(P).query(P, k=k + 1, workers=-1)[1][:, 1:]
+    nb = P[idx]
+    centre = nb.mean(1)
+    X = nb - centre[:, None, :]
+    _, evec = np.linalg.eigh(np.einsum("nki,nkj->nij", X, X) / k)
+    normal = evec[:, :, 0]                      # smallest eigenvector = surface normal
+    resid = np.abs(np.einsum("ni,ni->n", P - centre, normal)) * scale_mm
+    proj = np.einsum("nki,ni->nk", X, normal) * scale_mm
+    spread = np.percentile(proj, 95, axis=1) - np.percentile(proj, 5, axis=1)
+    return resid, spread
+
+
+def surface_stats(pred, gt, scale_mm):
+    """The numbers that decide whether a training change actually helped.
+
+    Eyeballing two renders is not evidence; these are. Report them alongside
+    every before/after figure.
+    """
+    sp_p, sp_g = local_spacing(pred, scale_mm), local_spacing(gt, scale_mm)
+    dev = signed_deviation(pred, gt, scale_mm)
+    rough_p, _ = local_roughness(pred, scale_mm)
+    rough_g, _ = local_roughness(gt, scale_mm)
+    return {
+        # surface roughness -- normalised by spacing so the two clouds compare
+        # despite different densities. ⚠️ read local_roughness's warning first:
+        # only the pred-vs-gt DIFFERENCE means anything, never the absolute value.
+        "rough_norm": float(np.median(rough_p) / np.median(sp_p)),
+        "rough_norm_gt": float(np.median(rough_g) / np.median(sp_g)),
+        "rough_mm": float(np.median(rough_p)),
+        "rough_mm_gt": float(np.median(rough_g)),
+        # density uniformity -- the clearest current gap vs ground truth
+        "clump_pct": 100.0 * (sp_p < CLUMP_MM).mean(),
+        "clump_pct_gt": 100.0 * (sp_g < CLUMP_MM).mean(),
+        "spacing_cv": sp_p.std() / sp_p.mean(),
+        "spacing_cv_gt": sp_g.std() / sp_g.mean(),
+        "spacing_median_mm": float(np.median(sp_p)),
+        # surface accuracy -- signed, so bias and scatter stay distinguishable
+        "dev_abs_median_mm": float(np.median(np.abs(dev))),
+        "dev_abs_p95_mm": float(np.percentile(np.abs(dev), 95)),
+        "dev_bias_mm": float(dev.mean()),
+        "dev_std_mm": float(dev.std()),
+        "outside_pct": 100.0 * (dev > 0).mean(),
+    }
+
+
+def format_stats(rows):
+    """rows: list of (name, stats dict) -> a plain-text comparison table."""
+    head = (f"{'':22s} {'clump<2mm':>10s} {'spacingCV':>10s} {'|dev|med':>10s} "
+            f"{'|dev|p95':>10s} {'dev std':>9s} {'outside':>9s}")
+    out = [head, "-" * len(head)]
+    for name, s in rows:
+        out.append(f"{name:22s} {s['clump_pct']:9.1f}% {s['spacing_cv']:10.3f} "
+                   f"{s['dev_abs_median_mm']:8.2f}mm {s['dev_abs_p95_mm']:8.2f}mm "
+                   f"{s['dev_std_mm']:7.2f}mm {s['outside_pct']:8.1f}%")
+    if rows:
+        s = rows[0][1]
+        out += ["-" * len(head),
+                f"{'ground truth (ref)':22s} {s['clump_pct_gt']:9.1f}% {s['spacing_cv_gt']:10.3f}"]
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# plotly figures
+# --------------------------------------------------------------------------- #
+def fig_meshes(items, title="", height=620, camera="default"):
+    """items: list of (mesh, label). Side-by-side shaded meshes, shared camera.
+
+    `camera`: a key of CAMERAS, or an explicit dict(x=, y=, z=). Defaults to
+    "default" so every figure already in reports/ regenerates unchanged --
+    ⚠️ but read the note on CAMERAS first: that view does not show the defect.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    fig = make_subplots(rows=1, cols=len(items), specs=[[{"type": "mesh3d"}] * len(items)],
+                        subplot_titles=[lbl for _, lbl in items], horizontal_spacing=0.01)
+    for i, (m, _) in enumerate(items, start=1):
+        v, f = m.vertices, m.faces
+        fig.add_trace(go.Mesh3d(x=v[:, 0], y=v[:, 1], z=v[:, 2],
+                                i=f[:, 0], j=f[:, 1], k=f[:, 2],
+                                color="#d8d2c4", flatshading=False,
+                                lighting=MESH_LIGHTING, lightposition=MESH_LIGHT_POSITION,
+                                showscale=False, hoverinfo="skip"), row=1, col=i)
+    eye = CAMERAS[camera] if isinstance(camera, str) else camera
+    scene = dict(aspectmode="data", xaxis_visible=False, yaxis_visible=False,
+                 zaxis_visible=False, camera=dict(eye=dict(**eye)))
+    fig.update_layout(title=title, height=height, margin=dict(l=0, r=0, t=60, b=0),
+                      **{f"scene{i if i > 1 else ''}": scene for i in range(1, len(items) + 1)})
+    return fig
+
+
+def fig_smoothing_ladder(points, scale_mm, levels=("raw", "light", "default", "heavy"),
+                         title="", height=560, res=80):
+    """One cloud rendered at several smoothing levels, for picking a level.
+
+    Use this to see what the reconstruction is doing to your surface before
+    trusting any single render. Run it on ground truth too: whatever texture
+    shows up there is the reconstruction's, not your model's.
+
+    `res` defaults BELOW RECON's 128 on purpose. The panels each carry a full
+    mesh, and at 128 the "raw" preset alone emits 372k faces; the four-level
+    figure serialises to 30 MB, so a notebook holding two of them gains 60 MB of
+    output and takes tens of minutes to write. At 80 the figure is a few MB and
+    still shows what it needs to -- the point here is the relative texture
+    between levels, not absolute surface detail.
+
+    NOT a comparison tool. Two models rendered through this will differ by
+    whatever the reconstruction does, so use it on one cloud at a time; model
+    comparison goes through `fig_meshes` at the locked RECON settings.
+
+    ⚠️ Lowering `res` strengthens every rung, because PRESETS give sigma in
+    voxels. At res=64 the "heavy" rung opens a hole through the cranial vault
+    even on ground truth -- see the note on that preset. Read a perforated
+    panel as "this res is too coarse for this sigma", never as a defect.
+
+    A single level can be passed as a bare string: levels="raw" behaves the
+    same as levels=("raw",). Without this, the missing-comma version is a
+    string, iterating it yields characters, and the failure surfaces as a
+    baffling KeyError: 'r'.
+    """
+    if isinstance(levels, str):
+        levels = (levels,)
+    unknown = [k for k in levels if k not in PRESETS]
+    if unknown:
+        raise KeyError(f"unknown preset(s) {unknown}; available: {sorted(PRESETS)}")
+    return fig_meshes(
+        [(pc_to_mesh(points, scale_mm, res=res, **PRESETS[k]),
+          f"{k}<br><sub>r={PRESETS[k]['radius_mm']} σ={PRESETS[k]['sigma']} "
+          f"taubin={PRESETS[k]['taubin']}</sub>") for k in levels],
+        title=title, height=height)
+
+
+def fig_diagnostic(pred, gt, scale_mm, title="", height=620, dev_lim=None, sp_max=None):
+    """The two things a shaded mesh cannot show, side by side.
+
+    Left  -- signed deviation from the ground-truth surface: red outside, blue
+             inside, white on it. Symmetric red/blue speckle means the points
+             scatter around the surface rather than sitting on it.
+    Right -- nearest-neighbour spacing: dark points are clumped onto a
+             neighbour, i.e. wasted, since they cover no new surface.
+
+    `dev_lim` / `sp_max` fix the colour limits. Leave them None to auto-scale to
+    THIS cloud, which is fine for looking at one model and wrong for comparing
+    two: auto-scaling renders the best and the worst model in the same range of
+    colours, so a real difference disappears. `fig_spacing_grid` locks them for
+    you; pass them explicitly if you build a comparison by hand.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    P = np.asarray(pred, dtype=np.float64)
+    dev = signed_deviation(P, gt, scale_mm)
+    sp = local_spacing(P, scale_mm)
+    lim = float(dev_lim if dev_lim is not None else np.percentile(np.abs(dev), 95))
+
+    fig = make_subplots(rows=1, cols=2, specs=[[{"type": "scatter3d"}] * 2],
+                        subplot_titles=(f"Signed deviation (±{lim:.1f} mm, red = outside)",
+                                        "Nearest-neighbour spacing (dark = clumped)"),
+                        horizontal_spacing=0.02)
+    sp_hi = float(sp_max if sp_max is not None else np.percentile(sp, 95))
+    for col, (vals, cs, cmin, cmax, bar) in enumerate(
+            [(dev, "RdBu_r", -lim, lim, "mm"),
+             (sp, "Viridis", 0.0, sp_hi, "mm")], start=1):
+        fig.add_trace(go.Scatter3d(
+            x=P[:, 0], y=P[:, 1], z=P[:, 2], mode="markers",
+            marker=dict(size=1.9, color=vals, colorscale=cs, cmin=cmin, cmax=cmax,
+                        opacity=0.9, colorbar=dict(title=bar, len=0.72,
+                                                   x=0.46 if col == 1 else 1.0)),
+            hoverinfo="skip"), row=1, col=col)
+    scene = dict(aspectmode="data", xaxis_visible=False, yaxis_visible=False,
+                 zaxis_visible=False, camera=dict(eye=dict(x=0.0, y=-1.5, z=1.15)))
+    fig.update_layout(title=title, height=height, margin=dict(l=0, r=0, t=60, b=0),
+                      showlegend=False, scene=scene, scene2=scene)
+    return fig
+
+
+def fig_spacing_grid(items, scale_mm, title="", height=520, sp_max=None, clump_mm=CLUMP_MM):
+    """Several predictions side by side, coloured by nearest-neighbour spacing.
+
+    This is the figure for the density result. `fig_diagnostic` renders one model
+    at a time and auto-scales its colours to that model, so putting two of its
+    outputs next to each other makes a 12.8% clump rate and a 1.4% one look
+    alike. Here every panel shares one scale, computed across all of them, so
+    dark really does mean "closer together than in the panel next door".
+
+    Each panel's subtitle carries its own clump rate, since colour alone is hard
+    to read quantitatively. Ground truth scores 0.0% and is worth including as
+    the leftmost panel for reference.
+
+    items: list of (points, label).
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    sps = [local_spacing(np.asarray(p, dtype=np.float64), scale_mm) for p, _ in items]
+    hi = float(sp_max if sp_max is not None else
+               np.percentile(np.concatenate(sps), 97))
+    labels = [f"{lbl}<br><sub>clumped &lt;{clump_mm:g} mm: "
+              f"{(s < clump_mm).mean() * 100:.1f}%</sub>"
+              for (_, lbl), s in zip(items, sps)]
+
+    fig = make_subplots(rows=1, cols=len(items), horizontal_spacing=0.01,
+                        specs=[[{"type": "scatter3d"}] * len(items)], subplot_titles=labels)
+    # Panel titles sit at the very top of each cell, so the figure title has to be
+    # lifted clear of them or the two overlap.
+    for a in fig.layout.annotations:
+        a.y = min(a.y, 0.93)
+    for i, ((pts, _), sp) in enumerate(zip(items, sps), start=1):
+        P = np.asarray(pts, dtype=np.float64)
+        fig.add_trace(go.Scatter3d(
+            x=P[:, 0], y=P[:, 1], z=P[:, 2], mode="markers",
+            marker=dict(size=1.9, color=sp, colorscale="Viridis", cmin=0.0, cmax=hi,
+                        opacity=0.9, showscale=(i == len(items)),
+                        colorbar=dict(title="spacing<br>(mm)", len=0.72)),
+            hoverinfo="skip"), row=1, col=i)
+    scene = dict(aspectmode="data", xaxis_visible=False, yaxis_visible=False,
+                 zaxis_visible=False, camera=dict(eye=dict(x=0.0, y=-1.5, z=1.15)))
+    fig.update_layout(title=dict(text=title or ("Nearest-neighbour spacing "
+                                 f"(dark = clumped; colour scale locked 0–{hi:.1f} mm)"),
+                                 y=0.98, yanchor="top"),
+                      height=height, showlegend=False, margin=dict(l=0, r=0, t=110, b=0),
+                      **{f"scene{i if i > 1 else ''}": scene for i in range(1, len(items) + 1)})
+    return fig

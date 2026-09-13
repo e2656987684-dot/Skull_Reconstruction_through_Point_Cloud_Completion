@@ -1,0 +1,12 @@
+{
+  // These modules are importable only because each script and notebook calls
+  // sys.path.insert first. Pylance does not execute that line, so without this
+  // setting it marks `import mesh_viz` / `report` / `mesh_preview` /
+  // `msn_skullfix` as unresolved -- which looks like a missing dependency but is
+  // fine at run time.
+  "python.analysis.extraPaths": ["src/eval", "src/models", "src/data"],
+
+  // Do not commit a notebook's large figure outputs; see notebooks/README.md.
+  // This is only a reminder -- the editor does not clear them.
+  "notebook.output.textLineLimit": 60
+}

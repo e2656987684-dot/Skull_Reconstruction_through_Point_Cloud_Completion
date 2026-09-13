@@ -1,0 +1,155 @@
+"""Re-evaluate the released pretrained weights, repeatedly, with the full metric set.
+
+The vendor model's inference is NOT deterministic. Its sampler picks centroids
+with a stateful RNG, and with replacement, so the same weights on the same skull
+give a different output every call. Every number previously reported for this
+baseline came from a single draw, with no idea how much a second would move it.
+That matters most for one claim: the published DCD and this project's measurement
+agree to within 1%, which is the evidence that the metric implementation and the
+weight loading are both correct, and an agreement that size deserves to be quoted
+with its spread.
+
+Warning: the fix is NOT to make the sampler deterministic. That module is the
+published architecture lifted verbatim, and the stochastic sampling is how the
+authors' model actually behaves; replacing it would mean reporting a modified
+version of their work as their baseline. The honest treatment is to draw N times
+and report the distribution, which is what this does.
+
+It also supplies the primary metric, which the archived baseline lacked -- that
+file holds only CD_t, CD_p and DCD, with no defect-region columns, no HD95 and no
+F-score, while the results are reported on defect-region coverage. The metrics
+here come from the same function every other run uses, so the columns line up.
+
+Warning: the baseline has to be scored on the SAME skulls as the model it is
+compared with, so under cross-validation run it once per fold, passing that
+fold's run through `--split-from` and giving each its own `--out`. Nothing is
+hardcoded to one split.
+
+    python src/eval/eval_pretrained_baseline.py               # 5 draws, 20 skulls
+    python src/eval/eval_pretrained_baseline.py --draws 2 --n-skulls 2   # smoke test
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, "src", "models"))
+sys.path.insert(0, os.path.join(REPO, "src", "eval"))
+os.environ.setdefault("HF_HOME", "/root/.cache/huggingface")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+import numpy as np
+import pandas as pd
+
+PAPER_DCD = 1.41269          # source paper, Table 1
+SUMMARY = ["CD_t_mm", "HD95_mm", "F1@0.05", "F1@0.03", "DCD",
+           "defect_cov_mm", "defect_HD95_mm", "defect_prec_mm", "defect_F1@0.05"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--draws", type=int, default=5,
+                    help="independent inference passes over the whole validation set. Each one "
+                         "re-samples the vendor model's centroids, so the spread across draws is "
+                         "the sampler's contribution to every reported number.")
+    ap.add_argument("--n-skulls", type=int, default=0, help="0 = the whole validation split")
+    ap.add_argument("--split-from", default="cd_rep05_full_f0",
+                    help="run under experiments_log/ whose val_ids define the split. Every run "
+                         "shares the same 20 skulls, and reading it from experiments_log rather "
+                         "than experiments/ keeps this working after weights are pruned.")
+    ap.add_argument("--out", default="")
+    args = ap.parse_args()
+
+    import tensorflow as tf
+    for g in tf.config.experimental.list_physical_devices("GPU"):
+        tf.config.experimental.set_memory_growth(g, True)
+    import msn_demo_arch as demo
+    import report as rp
+
+    weights = os.path.join(REPO, rp.MSN_WEIGHTS)
+    data = np.load(os.path.join(REPO, rp.DATA_CACHE))
+    ids, inputs, gt, scales = data["ids"], data["inputs"], data["gt"], data["scale_mm"]
+    meta = json.load(open(os.path.join(REPO, "experiments_log", args.split_from, "run.json")))
+    val = meta["val_ids"][:args.n_skulls] if args.n_skulls else meta["val_ids"]
+    pos = [int(np.where(ids == s)[0][0]) for s in val]
+
+    # Fixed global seed: the sampler stays stateful (draws differ from each other,
+    # which is the point) but the SEQUENCE of draws is reproducible, so re-running
+    # this script gives the same table.
+    tf.keras.utils.set_random_seed(42)
+
+    AE = demo.PCT_AE_Multimodal(bert_model=demo.bert_model,
+                                PCT_encoder=demo.PCT_encoder,
+                                pct_decoder=demo.pct_decoder)
+    before = [w.numpy().copy() for w in AE.model.weights[:40]]
+    AE.model.load_weights(weights)              # strict: no by_name, no skip_mismatch
+    changed = sum(1 for b, w in zip(before, AE.model.weights) if not np.array_equal(b, w.numpy()))
+    if changed <= 30:
+        raise SystemExit(f"only {changed}/40 weight tensors changed -- wrong architecture module?")
+    print(f"weight-load check: {changed} of the leading 40 tensors were overwritten   "
+          f"({AE.model.count_params() / 1e6:.1f}M parameters, BERT included)")
+
+    tok = demo.BertTokenizer.from_pretrained("bert-base-uncased")
+    enc = tok.encode_plus("skull", add_special_tokens=True, max_length=128,
+                          padding="max_length", truncation=True, return_tensors="tf")
+    n = len(pos)
+    x = [inputs[pos],
+         np.zeros((n, 1, 1), np.float32),
+         np.tile(enc["input_ids"].numpy(), (n, 1)),
+         np.tile(enc["attention_mask"].numpy(), (n, 1))]
+
+    # Implant ground truth for the defect region (2026-08-28: the region is no
+    # longer a distance rule). Loaded before the loop so a missing skull fails
+    # immediately rather than after the first inference pass.
+    labels = rp.defect_labels(REPO)
+    missing = [s for s in val if s not in labels]
+    if missing:
+        raise SystemExit(f"no defect ground-truth labels for these skulls: {missing}\n"
+                         f"run first: python src/eval/make_defect_labels.py")
+
+    rows = []
+    for draw in range(args.draws):
+        # predict(), not model(x) in a loop: the latter leaks 0.29 GiB per call
+        # (measured on this project's own model) and 100 calls would exhaust the card.
+        preds = AE.model.predict(x, batch_size=1, verbose=0)
+        for sid, i, p in zip(val, pos, preds):
+            row = {"draw": draw, "id": sid}
+            row.update(rp.metrics_from_points(p, gt[i], float(scales[i]), inp=inputs[i],
+                                              defect_mask=labels[sid]))
+            rows.append(row)
+        print(f"  draw {draw + 1}/{args.draws}: {n} skulls")
+
+    df = pd.DataFrame(rows)
+    out = args.out or os.path.join(REPO, "experiments_log", "pretrained_baseline",
+                                   f"eval_val20_x{args.draws}.csv")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    df.to_csv(out, index=False)
+
+    # Two different spreads, and they answer different questions.
+    per_draw = df.groupby("draw")[SUMMARY].mean()          # the reported number, per draw
+    print(f"\n{n} validation skulls x {args.draws} independent draws"
+          f"  ->  {os.path.relpath(out, REPO)}")
+    print(f"\n{'metric':16}{'mean':>10}{'std/draw':>12}{'range/draw':>12}{'std/skull':>12}")
+    print("-" * 62)
+    for c in SUMMARY:
+        print(f"{c:16}{per_draw[c].mean():>10.4f}{per_draw[c].std(ddof=1):>12.4f}"
+              f"{per_draw[c].max() - per_draw[c].min():>12.4f}{df[c].std(ddof=1):>12.4f}")
+    print("\n'std/draw' is how much the reported number moves when inference is re-run, "
+          "which is the question."
+          "\n'std/skull' is how much skulls differ from each other -- nothing to do with "
+          "the sampler, only there to give the first column a scale.")
+
+    dcd = per_draw["DCD"]
+    print(f"\nreproducibility check: the paper reports DCD = {PAPER_DCD}")
+    print(f"  measured {dcd.mean():.5f} +- {dcd.std(ddof=1):.5f} over {args.draws} draws"
+          f"  ->  a difference of {abs(dcd.mean() - PAPER_DCD) / PAPER_DCD * 100:.1f}%"
+          f", against sampling noise of only {dcd.std(ddof=1) / PAPER_DCD * 100:.2f}%")
+
+
+if __name__ == "__main__":
+    main()

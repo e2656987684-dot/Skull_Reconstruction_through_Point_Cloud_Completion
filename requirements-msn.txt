@@ -1,0 +1,39 @@
+# The one environment this project uses: notebooks, data preparation, training
+# and evaluation all run in it.
+#
+# Why the versions are pinned:
+#   - Python must be 3.11: PyPI has no cp312 wheel for tensorflow<2.16.
+#   - tensorflow must be <2.16: this is the last version transformers validates
+#     against that still ships TFBertModel. Later versions default to Keras 3,
+#     which needs numpy>=2 and conflicts with the numpy<2 requirement here.
+#   - transformers must be <5: 5.0 removed the TensorFlow backend entirely.
+#   - the [and-cuda] extra brings the matching CUDA 12 libraries; without it
+#     tensorflow does not find the GPU.
+#
+# Warning: do not add torch to this environment. tensorflow[and-cuda] and torch
+# ship nvidia-nccl packages for different CUDA majors that install to the same
+# path and overwrite each other, which breaks torch at import. Use a separate
+# environment if torch is ever needed.
+numpy<2
+trimesh
+# rtree gives trimesh its accelerated closest-point query. It is not used to
+# compute any reported metric -- src/eval/point_to_surface.py has its own
+# implementation about 20x faster -- only as an INDEPENDENT cross-check, which
+# each run performs on 200 points and which agrees to 4.4e-16 mm. Without it that
+# check is skipped and the run continues.
+rtree
+pynrrd
+plotly
+fpsample
+matplotlib
+scikit-image
+ipywidgets
+tensorflow[and-cuda]<2.16
+transformers<5
+kaleido
+# hf_transfer is required when HF_HUB_ENABLE_HF_TRANSFER=1 is set in the
+# environment, as some container images do; loading a pretrained model fails
+# outright without it.
+hf_transfer
+nbformat>=4.2.0
+pandas
