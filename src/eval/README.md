@@ -33,6 +33,7 @@ into `experiments_log/`.
 | `mesh_preview.py` | a rendered look at one completion | `reports/preview/*.png` | yes |
 | `make_report_figures.py` | the figures for the write-up | `reports/figures/*.png` | yes |
 | `fig_qualitative_completion.py` | one case as input, completion and ground truth, rebuilt on one shared grid and camera | `reports/figures/qualitative_completion_case039.png` | no |
+| `fig_sagittal_sections.py` | the same case as filled sagittal sections of the reconstruction field, prediction-only region highlighted | `reports/figures/sagittal_section_case039*.png` | no |
 
 ## Usage
 

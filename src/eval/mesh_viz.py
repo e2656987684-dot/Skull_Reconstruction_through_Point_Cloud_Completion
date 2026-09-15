@@ -121,6 +121,33 @@ MESH_LIGHTING = dict(ambient=0.42, diffuse=0.85, specular=0.12, roughness=0.85, 
 MESH_LIGHT_POSITION = dict(x=120, y=180, z=200)
 
 
+def distance_field(points, scale_mm, *, bounds=None, **overrides):
+    """The smoothed nearest-point distance field pc_to_mesh extracts its surface from.
+
+    Returns (field, lo, hi, level): field[i, j, k] sits at lo + (i, j, k) * step
+    with step = (hi - lo) / (res - 1), and the reconstructed solid is
+    field <= level (radius_mm / scale_mm, normalised units).
+    """
+    cfg = {**RECON, **overrides}
+    P = np.asarray(points, dtype=np.float64)
+    r = cfg["radius_mm"] / scale_mm
+
+    if bounds is None:
+        lo, hi = P.min(0) - cfg["pad"], P.max(0) + cfg["pad"]
+    else:
+        lo, hi = (np.asarray(b, dtype=np.float64) for b in bounds)
+        if (P < lo).any() or (P > hi).any():
+            raise ValueError("bounds do not contain the cloud; the surface would be clipped")
+    res = cfg["res"]
+    axes = [np.linspace(lo[i], hi[i], res) for i in range(3)]
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+
+    field = cKDTree(P).query(grid, workers=-1)[0].reshape(res, res, res)
+    if cfg["sigma"] > 0:
+        field = gaussian_filter(field, cfg["sigma"])
+    return field, lo, hi, r
+
+
 def pc_to_mesh(points, scale_mm, *, bounds=None, **overrides):
     """Point cloud -> shaded-renderable mesh, via a KD-tree distance field.
 
@@ -152,22 +179,8 @@ def pc_to_mesh(points, scale_mm, *, bounds=None, **overrides):
     models is not -- see the module docstring.
     """
     cfg = {**RECON, **overrides}
-    P = np.asarray(points, dtype=np.float64)
-    r = cfg["radius_mm"] / scale_mm
-
-    if bounds is None:
-        lo, hi = P.min(0) - cfg["pad"], P.max(0) + cfg["pad"]
-    else:
-        lo, hi = (np.asarray(b, dtype=np.float64) for b in bounds)
-        if (P < lo).any() or (P > hi).any():
-            raise ValueError("bounds do not contain the cloud; the surface would be clipped")
+    field, lo, hi, r = distance_field(points, scale_mm, bounds=bounds, **overrides)
     res = cfg["res"]
-    axes = [np.linspace(lo[i], hi[i], res) for i in range(3)]
-    grid = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
-
-    field = cKDTree(P).query(grid, workers=-1)[0].reshape(res, res, res)
-    if cfg["sigma"] > 0:
-        field = gaussian_filter(field, cfg["sigma"])
 
     verts, faces, _, _ = measure.marching_cubes(field, level=r)
     step = np.array([(hi[i] - lo[i]) / (res - 1) for i in range(3)])
